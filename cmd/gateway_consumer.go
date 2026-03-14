@@ -895,11 +895,16 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 
 		// --- Bot mention: route to mentioned bot (Telegram doesn't deliver bot→bot messages) ---
 		// Same pattern as teammate, using "delegate" lane.
+		// Session is keyed by target_channel (the mentioned bot's channel), not origin_channel.
 		if msg.Channel == tools.ChannelSystem && strings.HasPrefix(msg.SenderID, "bot_mention:") {
 			origChannel := msg.Metadata["origin_channel"]
+			targetChannel := msg.Metadata["target_channel"]
+			if targetChannel == "" {
+				targetChannel = origChannel
+			}
 			origPeerKind := msg.Metadata["origin_peer_kind"]
 			origLocalKey := msg.Metadata["origin_local_key"]
-			origChannelType := resolveChannelType(channelMgr, origChannel)
+			targetChannelType := resolveChannelType(channelMgr, targetChannel)
 			targetAgent := msg.AgentID
 			if targetAgent == "" {
 				targetAgent = cfg.ResolveDefaultAgentID()
@@ -908,28 +913,29 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				origPeerKind = string(sessions.PeerGroup)
 			}
 
-			if origChannel == "" || msg.ChatID == "" {
-				slog.Warn("bot mention: missing origin — DROPPED",
+			if targetChannel == "" || msg.ChatID == "" {
+				slog.Warn("bot mention: missing target_channel or chat_id — DROPPED",
 					"sender", msg.SenderID,
 					"target", targetAgent,
-					"origin_channel", origChannel,
+					"target_channel", targetChannel,
 					"chat_id", msg.ChatID,
 				)
 				continue
 			}
 
-			sessionKey := sessions.BuildScopedSessionKey(targetAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
-			sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, targetAgent, origChannel, msg.ChatID, origPeerKind)
+			sessionKey := sessions.BuildScopedSessionKey(targetAgent, targetChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
+			sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, targetAgent, targetChannel, msg.ChatID, origPeerKind)
 
 			slog.Info("bot mention → scheduler (delegate lane)",
 				"from", msg.SenderID,
 				"to", targetAgent,
+				"target_channel", targetChannel,
 				"session", sessionKey,
 			)
 
 			announceUserID := msg.UserID
 			if origPeerKind == string(sessions.PeerGroup) && msg.ChatID != "" {
-				announceUserID = fmt.Sprintf("group:%s:%s", origChannel, msg.ChatID)
+				announceUserID = fmt.Sprintf("group:%s:%s", targetChannel, msg.ChatID)
 			}
 
 			outMeta := buildAnnounceOutMeta(origLocalKey)
@@ -937,8 +943,8 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			outCh := sched.Schedule(ctx, scheduler.LaneDelegate, agent.RunRequest{
 				SessionKey:  sessionKey,
 				Message:     msg.Content,
-				Channel:     origChannel,
-				ChannelType: origChannelType,
+				Channel:     targetChannel,
+				ChannelType: targetChannelType,
 				ChatID:      msg.ChatID,
 				PeerKind:    origPeerKind,
 				LocalKey:    origLocalKey,
@@ -947,7 +953,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				Stream:      false,
 			})
 
-			go func(origCh, chatID string, meta map[string]string) {
+			go func(replyChannel, chatID string, meta map[string]string) {
 				outcome := <-outCh
 				if outcome.Err != nil {
 					slog.Error("bot mention: agent run failed", "error", outcome.Err)
@@ -958,14 +964,14 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					return
 				}
 				outMsg := bus.OutboundMessage{
-					Channel:  origCh,
+					Channel:  replyChannel,
 					ChatID:   chatID,
 					Content:  outcome.Result.Content,
 					Metadata: meta,
 				}
 				appendMediaToOutbound(&outMsg, outcome.Result.Media)
 				msgBus.PublishOutbound(outMsg)
-			}(origChannel, msg.ChatID, outMeta)
+			}(targetChannel, msg.ChatID, outMeta)
 			continue
 		}
 

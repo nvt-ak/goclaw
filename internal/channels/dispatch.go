@@ -150,9 +150,12 @@ func (m *Manager) dispatchBotMentions(ctx context.Context, msg bus.OutboundMessa
 		if !ok {
 			continue
 		}
-		// Inject InboundMessage for the mentioned bot (same pattern as teammate)
+		// Inject InboundMessage for the mentioned bot (same pattern as teammate).
+		// target_channel: the mentioned bot's channel — session is keyed by this (not origin).
+		// When user mentions techlead, session is agent+telegram_techlead+chatID.
 		meta := map[string]string{
 			"origin_channel":   msg.Channel,
+			"target_channel":   tgt.channelName,
 			"origin_peer_kind": "group",
 			"from_agent":       fromBotUsername,
 			"to_agent":         tgt.agentID,
