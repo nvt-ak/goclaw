@@ -893,6 +893,82 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			continue
 		}
 
+		// --- Bot mention: route to mentioned bot (Telegram doesn't deliver bot→bot messages) ---
+		// Same pattern as teammate, using "delegate" lane.
+		if msg.Channel == tools.ChannelSystem && strings.HasPrefix(msg.SenderID, "bot_mention:") {
+			origChannel := msg.Metadata["origin_channel"]
+			origPeerKind := msg.Metadata["origin_peer_kind"]
+			origLocalKey := msg.Metadata["origin_local_key"]
+			origChannelType := resolveChannelType(channelMgr, origChannel)
+			targetAgent := msg.AgentID
+			if targetAgent == "" {
+				targetAgent = cfg.ResolveDefaultAgentID()
+			}
+			if origPeerKind == "" {
+				origPeerKind = string(sessions.PeerGroup)
+			}
+
+			if origChannel == "" || msg.ChatID == "" {
+				slog.Warn("bot mention: missing origin — DROPPED",
+					"sender", msg.SenderID,
+					"target", targetAgent,
+					"origin_channel", origChannel,
+					"chat_id", msg.ChatID,
+				)
+				continue
+			}
+
+			sessionKey := sessions.BuildScopedSessionKey(targetAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
+			sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, targetAgent, origChannel, msg.ChatID, origPeerKind)
+
+			slog.Info("bot mention → scheduler (delegate lane)",
+				"from", msg.SenderID,
+				"to", targetAgent,
+				"session", sessionKey,
+			)
+
+			announceUserID := msg.UserID
+			if origPeerKind == string(sessions.PeerGroup) && msg.ChatID != "" {
+				announceUserID = fmt.Sprintf("group:%s:%s", origChannel, msg.ChatID)
+			}
+
+			outMeta := buildAnnounceOutMeta(origLocalKey)
+
+			outCh := sched.Schedule(ctx, scheduler.LaneDelegate, agent.RunRequest{
+				SessionKey:  sessionKey,
+				Message:     msg.Content,
+				Channel:     origChannel,
+				ChannelType: origChannelType,
+				ChatID:      msg.ChatID,
+				PeerKind:    origPeerKind,
+				LocalKey:    origLocalKey,
+				UserID:      announceUserID,
+				RunID:       fmt.Sprintf("bot-mention-%s-%s", msg.Metadata["from_agent"], msg.Metadata["to_agent"]),
+				Stream:      false,
+			})
+
+			go func(origCh, chatID string, meta map[string]string) {
+				outcome := <-outCh
+				if outcome.Err != nil {
+					slog.Error("bot mention: agent run failed", "error", outcome.Err)
+					return
+				}
+				if (outcome.Result.Content == "" && len(outcome.Result.Media) == 0) || agent.IsSilentReply(outcome.Result.Content) {
+					slog.Debug("bot mention: suppressed silent/empty reply")
+					return
+				}
+				outMsg := bus.OutboundMessage{
+					Channel:  origCh,
+					ChatID:   chatID,
+					Content:  outcome.Result.Content,
+					Metadata: meta,
+				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
+				msgBus.PublishOutbound(outMsg)
+			}(origChannel, msg.ChatID, outMeta)
+			continue
+		}
+
 		// --- Command: /reset — clear session history ---
 		if msg.Metadata["command"] == "reset" {
 			agentID := msg.AgentID
